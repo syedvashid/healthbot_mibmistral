@@ -5,3 +5,8 @@ langchain
 httpx
 langchain-community
 reportlab
+motor
+mysql-connector-python 
+python-dotenv
+pymysql
+sqlalchemy

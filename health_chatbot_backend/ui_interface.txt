@@ -1,0 +1,1175 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+import asyncio
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="mistral",
+    temperature=0.7,
+    max_tokens=200,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a medical assistant. Ask concise follow-up questions about symptoms one question at a time  maximum 10 questions . 
+If the query is non-medical, respond: "I specialize only in health-related topics." Then ask a health question."""
+
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+
+REPORT_PROMPT = """Generate a professional medical report:
+
+**Patient Summary**
+- Chief Complaint: {chief_complaint}
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Symptom analysis
+- Potential concerns
+
+**Recommendations**
+- Suggested next steps
+
+Format this for doctor review. Be concise yet comprehensive.
+
+Conversation:
+{conversation_history}"""
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        
+        for msg in request.conversation_history:
+            if msg["role"] == "user":
+                memory.chat_memory.add_user_message(msg["content"])
+            else:
+                memory.chat_memory.add_ai_message(msg["content"])
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(MEDICAL_PROMPT),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        # Generate report text
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history
+        )
+        
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        story.append(Paragraph("Medical Consultation Report", styles['Title']))
+        for paragraph in report_text.split('\n\n'):
+            if paragraph.strip():
+                story.append(Paragraph(paragraph.strip(), styles['Normal']))
+        
+        doc.build(story)
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department) {
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <h2>Enter Your Details</h2>
+          <form>
+            <label>
+              Name:
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </label>
+            <label>
+              Age:
+              <input
+                type="number"
+                value={formData.age}
+                onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+              />
+            </label>
+            <label>
+              Gender:
+              <select
+                value={formData.gender}
+                onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+              >
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+            </label>
+            <label>
+              Department:
+              <input
+                type="text"
+                value={formData.department}
+                onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+              />
+            </label>
+            <div className="form-buttons">
+              <button type="button" onClick={handleFormSubmit}>
+                Open Chatbot
+              </button>
+              <button type="button" onClick={() => alert('Offline Report feature coming soon!')}>
+                Offline Report
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+            
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* Existing styles for the chatbot */
+.app {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 1rem;
+  font-family: Arial, sans-serif;
+}
+
+.header {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+
+.header h1 {
+  color: #2196F3;
+}
+
+.chat-container {
+  display: flex;
+  justify-content: center;
+}
+
+.chat-box {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background-color: #f9f9f9;
+  min-height: 400px;
+  max-height: 500px;
+}
+
+.message {
+  margin-bottom: 0.8rem;
+  padding: 0.8rem;
+  border-radius: 8px;
+  max-width: 80%;
+}
+
+.message.user {
+  background-color: #e3f2fd;
+  margin-left: auto;
+  color: #333;
+}
+
+.message.assistant {
+  background-color: #f1f1f1;
+  margin-right: auto;
+  color: #333;
+}
+
+.message.typing {
+  background-color: #f1f1f1;
+  color: #999;
+  font-style: italic;
+}
+
+.welcome-message {
+  text-align: center;
+  color: #999;
+  font-style: italic;
+}
+
+.input-area {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+}
+
+.input-area input {
+  flex: 1;
+  padding: 0.8rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 1rem;
+}
+
+.input-area button {
+  padding: 0.8rem 1.5rem;
+  background-color: #4CAF50;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.input-area button:hover {
+  background-color: #45a049;
+}
+
+.input-area button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
+/* Styles for the report button */
+.report-container {
+  display: flex;
+  justify-content: center;
+  margin-top: 1rem;
+}
+
+.report-btn {
+  padding: 0.8rem 1.5rem;
+  background-color: #2196F3;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: bold;
+}
+
+.report-btn:hover {
+  background-color: #0b7dda;
+}
+
+.report-btn:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
+/* Styles for the form */
+.form-container {
+  max-width: 400px;
+  margin: 0 auto;
+  padding: 1rem;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  background-color: #f9f9f9;
+}
+
+.form-container h2 {
+  text-align: center;
+  color: #333;
+}
+
+.form-container label {
+  display: block;
+  margin-bottom: 0.8rem;
+  color: #555;
+}
+
+.form-container input,
+.form-container select {
+  width: 100%;
+  padding: 0.8rem;
+  margin-top: 0.3rem;
+  margin-bottom: 1rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 1rem;
+}
+
+.form-buttons {
+  display: flex;
+  justify-content: space-between;
+}
+
+.form-buttons button {
+  padding: 0.8rem 1.5rem;
+  background-color: #2196F3;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.form-buttons button:hover {
+  background-color: #0b7dda;
+}
+
+.form-buttons button:disabled {
+  background-color: #cccccc;
+  cursor: not-allowed;
+}
+
+
+
+
+
+
+
+
+
+
+
+                     this code where 257,253,184 some basic problem ---- risk detection function(additional), pdf offline,wrong prompt
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+import asyncio
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="mistral",
+    temperature=0.7,
+    max_tokens=200,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a medical assistant. Ask concise follow-up questions about symptoms one question at a time  maximum 10 questions . 
+If the query is non-medical, respond: "I specialize only in health-related topics." Then ask a health question."""
+
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+
+REPORT_PROMPT = """Generate a professional medical report:
+
+**Patient Summary**
+- Chief Complaint: {chief_complaint}
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Symptom analysis
+- Potential concerns
+
+**Recommendations**
+- Suggested next steps
+
+Format this for doctor review. Be concise yet comprehensive.
+
+Conversation:
+{conversation_history}"""
+
+OFFLINE_REPORT_PROMPT = """Generate a professional offline medical report:
+
+**Patient Details**
+- Name: {name}
+- Age: {age}
+- Gender: {gender}
+- Department: {department}
+
+**Risk Assessment**
+- {risk_level}
+
+**Assessment and Recommendations**
+Based on the following responses:
+{responses}
+
+Provide a concise yet professional summary for doctor review."""
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        
+        for msg in request.conversation_history:
+            if msg["role"] == "user":
+                memory.chat_memory.add_user_message(msg["content"])
+            else:
+                memory.chat_memory.add_ai_message(msg["content"])
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(MEDICAL_PROMPT),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt, memory=memory)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        # Generate report text
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history
+        )
+        
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        story.append(Paragraph("Medical Consultation Report", styles['Title']))
+        for paragraph in report_text.split('\n\n'):
+            if paragraph.strip():
+                story.append(Paragraph(paragraph.strip(), styles['Normal']))
+        
+        doc.build(story)
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        # Determine risk level based on responses
+        risk_level = determine_risk_level(request.responses)
+
+        # Generate report text
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "risk_level", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            risk_level=risk_level,
+            responses=request.responses
+        )
+
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+
+        story.append(Paragraph("Offline Medical Report", styles['Title']))
+        for paragraph in report_text.split('\n\n'):
+            if paragraph.strip():
+                story.append(Paragraph(paragraph.strip(), styles['Normal']))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=offline_medical_report.pdf"}
+        )
+    except Exception as e:
+        logger.error(f"Offline report error: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+def determine_risk_level(responses):
+    # Example basic implementation of risk level determination
+    for response in responses:
+        if response["option"] in ["D"]:  # Example: High-risk options
+            return "High Risk"
+    return "Low Risk"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department) {
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department) {
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: "A" },
+      { questionId: 2, option: "C" },
+      { questionId: 3, option: "B" },
+      { questionId: 4, option: "D" },
+      { questionId: 5, option: "A" },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          responses: responses,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <h2>Enter Your Details</h2>
+          <form>
+            <label>
+              Name:
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </label>
+            <label>
+              Age:
+              <input
+                type="number"
+                value={formData.age}
+                onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+              />
+            </label>
+            <label>
+              Gender:
+              <select
+                value={formData.gender}
+                onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+              >
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+            </label>
+            <label>
+              Department:
+              <input
+                type="text"
+                value={formData.department}
+                onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+              />
+            </label>
+            <div className="form-buttons">
+              <button type="button" onClick={handleFormSubmit}>
+                Open Chatbot
+              </button>
+              <button type="button" onClick={generateOfflineReport}>
+                Offline Report
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+            
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;

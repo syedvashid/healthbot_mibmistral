@@ -1,0 +1,947 @@
+v11 --------496,50,341,244
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict,Optional
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+import time
+from bson.objectid import ObjectId
+
+from database import connect_db, close_db, add_chat_history, add_question, add_option, add_answer,options_collection
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_db_client():
+    await connect_db()
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    await close_db()
+
+
+
+# Keep track of question number per chat session (you might need a more robust way to manage this in a production app)
+chat_question_counter = {}
+last_question_id = {} # To store the ID of the last asked question for a session
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+    name: str  # Add name
+    age: int   # Add age
+    gender: str # Add gender
+    department: str # Assuming 'department' from frontend is reason_for_visit
+    chat_history_id: Optional[str] = None  # Optional field for chat history ID
+    
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a professional medical assistant.,Based on conversation history, and preferred language, generate exactly 5 multiple-choice questions (one at a time) to gather information about the patient’s condition and question must be  related to given disease.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- All questions and options must be in the selected language: {language}.
+- after 5 questions end conversatio by  recommend consulting a doctor for further assistance and suggest for download the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+# Core Chat Endpoint
+
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        chat_history_id = request.chat_history_id
+        if not chat_history_id:
+            patient_id = f"{request.name}_{request.age}_{int(time.time())}" # Generate unique ID
+            chat_history_id = await add_chat_history({
+                "_id": patient_id,
+                "reason_for_visit": request.department,
+                "language": request.language,
+                "patient_name": request.name,
+                "age": request.age,
+                "gender": request.gender
+            })
+            logger.info(f"New chat history stored with ID: {chat_history_id}")
+
+        user_input = request.user_input.strip().upper()
+        last_q_id = last_question_id.get(chat_history_id)
+
+        if last_q_id and user_input in ['A', 'B', 'C', 'D']:
+            # User has provided an answer to the last question
+            option = await options_collection.find_one({"question_id": ObjectId(last_q_id), "option_no": user_input})
+            if option:
+                await add_answer({
+                    "question_id": ObjectId(last_q_id),
+                    "answer_id": option["_id"]
+                })
+                logger.info(f"Answer '{user_input}' stored for question {last_q_id}")
+
+                # Now, generate the next question
+                conv_history = "\n".join(
+                    f"{msg['role'].upper()}: {msg['content']}"
+                    for msg in request.conversation_history + [{'role': 'user', 'content': user_input}] # Add the answer to history
+                )
+
+                prompt = ChatPromptTemplate.from_messages([
+                    SystemMessagePromptTemplate.from_template(
+                        MEDICAL_PROMPT.format(
+                            conversation_history=conv_history,
+                            language=request.language
+                        )
+                    ),
+                    HumanMessagePromptTemplate.from_template("{user_input}"),
+                ])
+
+                chain = LLMChain(llm=llm, prompt=prompt)
+                llm_response = await chain.arun(user_input="") # Send an empty input to get the next question
+                response_lines = llm_response.strip().split('\n')
+
+                question_text = ""
+                options = []
+                for line in response_lines:
+                    if not line.startswith(('A.', 'B.', 'C.', 'D.')):
+                        question_text += line.strip() + " "
+                    elif line.startswith(('A.', 'B.', 'C.', 'D.')):
+                        parts = line.split('(', 1)
+                        option_text = parts[0].split('.', 1)[1].strip()
+                        ehr_terminology = parts[1][:-1].strip() if len(parts) > 1 else ""
+                        options.append({
+                            "option_no": line[0],
+                            "option_text": option_text,
+                            "ehr_terminology": ehr_terminology
+                        })
+
+                question_text = question_text.strip()
+                current_question_id = None
+                if question_text and len(options) == 4:
+                    chat_question_counter[chat_history_id] = chat_question_counter.get(chat_history_id, 0) + 1
+                    question_no = chat_question_counter[chat_history_id]
+
+                    question_data = {
+                        "chat_history_id": chat_history_id,
+                        "question_no": question_no,
+                        "question_text": question_text
+                    }
+                    question_result = await add_question(question_data)
+                    current_question_id = question_result
+
+                    logger.info(f"Next question stored with ID: {current_question_id} for chat {chat_history_id}")
+                    last_question_id[chat_history_id] = current_question_id # Update the last question ID
+
+                    for option in options:
+                        await add_option({
+                            "question_id": current_question_id,
+                            "option_no": option["option_no"],
+                            "option_text": option["option_text"],
+                            "ehr_terminology": option["ehr_terminology"]
+                        })
+                        logger.info(f"Option '{option['option_no']}' stored for question {current_question_id}")
+
+                    return {"response": llm_response.strip(), "chat_history_id": chat_history_id, "question_id": str(current_question_id)}
+
+                else:
+                    logger.warning(f"Failed to parse next question and options from LLM response: {llm_response}")
+                    return {"response": llm_response.strip(), "chat_history_id": chat_history_id}
+
+            else:
+                return {"response": f"Invalid option '{user_input}'. Please select A, B, C, or D.", "chat_history_id": chat_history_id}
+
+        else:
+            # Treat as a new question or continuation
+            conv_history = "\n".join(
+                f"{msg['role'].upper()}: {msg['content']}"
+                for msg in request.conversation_history
+            )
+
+            prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(
+                    MEDICAL_PROMPT.format(
+                        conversation_history=conv_history,
+                        language=request.language
+                    )
+                ),
+                HumanMessagePromptTemplate.from_template("{user_input}"),
+            ])
+
+            chain = LLMChain(llm=llm, prompt=prompt)
+            llm_response = await chain.arun(user_input=request.user_input)
+            response_lines = llm_response.strip().split('\n')
+
+            question_text = ""
+            options = []
+            for line in response_lines:
+                if not line.startswith(('A.', 'B.', 'C.', 'D.')):
+                    question_text += line.strip() + " "
+                elif line.startswith(('A.', 'B.', 'C.', 'D.')):
+                    parts = line.split('(', 1)
+                    option_text = parts[0].split('.', 1)[1].strip()
+                    ehr_terminology = parts[1][:-1].strip() if len(parts) > 1 else ""
+                    options.append({
+                        "option_no": line[0],
+                        "option_text": option_text,
+                        "ehr_terminology": ehr_terminology
+                    })
+
+            question_text = question_text.strip()
+            current_question_id = None
+            if question_text and len(options) == 4:
+                chat_question_counter[chat_history_id] = chat_question_counter.get(chat_history_id, 0) + 1
+                question_no = chat_question_counter[chat_history_id]
+
+                question_data = {
+                    "chat_history_id": chat_history_id,
+                    "question_no": question_no,
+                    "question_text": question_text
+                }
+                question_result = await add_question(question_data)
+                current_question_id = question_result
+
+                logger.info(f"Question stored with ID: {current_question_id} for chat {chat_history_id}")
+                last_question_id[chat_history_id] = current_question_id # Store the current question ID
+
+                for option in options:
+                    await add_option({
+                        "question_id": current_question_id,
+                        "option_no": option["option_no"],
+                        "option_text": option["option_text"],
+                        "ehr_terminology": option["ehr_terminology"]
+                    })
+                    logger.info(f"Option '{option['option_no']}' stored for question {current_question_id}")
+
+                return {"response": llm_response.strip(), "chat_history_id": chat_history_id, "question_id": str(current_question_id)}
+
+            else:
+                logger.warning(f"Failed to parse question and options from LLM response: {llm_response}")
+                return {"response": llm_response.strip(), "chat_history_id": chat_history_id}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+
+   
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+
+
+
+
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+import formImage from './img.png';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+    language: 'English', // New field for language
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+  const [chatHistoryId, setChatHistoryId] = useState(null); // New state for chatHistoryId
+  const [currentQuestionId, setCurrentQuestionId] = useState(null); // State for the current question ID
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages, // Pass the entire conversation history
+          language: formData.language,    // Added field
+          name: formData.name,           // Include name
+          age: formData.age,             // Include age
+          gender: formData.gender,
+          department: formData.department, // Include department
+          chat_history_id: chatHistoryId,
+        }),
+
+      });
+      
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+      // Store chatHistoryId after the first successful response
+       if (!chatHistoryId && data.chat_history_id) {
+          setChatHistoryId(data.chat_history_id);
+       }  
+       if (data.question_id) {
+                setCurrentQuestionId(data.question_id);
+       } else if (data.response === "Your answer has been recorded.") {
+                setCurrentQuestionId(null); // Clear question ID after answer
+       }
+
+
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,        // Include name
+          gender: formData.gender,    // Include gender
+          age: formData.age,          // Include age
+          language: formData.language, // Include language
+          conversation_history: messages,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          language: formData.language, // Include language in the request
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <img src={formImage} alt="Medical Illustration" className="form-image" />
+          <div>
+            <h2>Enter Your Details</h2>
+            <form>
+              <label>
+                Name:
+                <input
+                  type="text"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                />
+              </label>
+              <label>
+                Age:
+                <input
+                  type="number"
+                  value={formData.age}
+                  onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+                />
+              </label>
+              <label>
+                Gender:
+                <select
+                  value={formData.gender}
+                  onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+                >
+                  <option value="Male">Male</option>
+                  <option value="Female">Female</option>
+                  <option value="Other">Other</option>
+                </select>
+              </label>
+              <label>
+                Problem:
+                <input
+                  type="text"
+                  value={formData.department}
+                  onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+                />
+              </label>
+              <label>
+                Language:
+                <select
+                  value={formData.language}
+                  onChange={(e) => setFormData({ ...formData, language: e.target.value })}
+                >
+                  <option value="English">English</option>
+                  <option value="Hindi">हिंदी</option>
+                  <option value="Telugu">తెలుగు</option>
+                </select>
+              </label>
+              <div className="form-buttons">
+                <button type="button" onClick={handleFormSubmit}>
+                  Open Chatbot
+                </button>
+                <button type="button" onClick={generateOfflineReport}>
+                  Offline Report
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+database-----
+
+
+
+
+import motor.motor_asyncio
+from bson.objectid import ObjectId
+
+
+# MongoDB connection details
+MONGO_DETAILS = "mongodb://localhost:27017"  # Replace with your MongoDB connection string if different
+DATABASE_NAME = "health_chatbot_db"        # Choose a name for your database
+
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
+database = client[DATABASE_NAME]
+
+# Define your collections
+chat_history_collection = database["chat_history"]
+question_collection = database["question"]
+options_collection = database["options"]
+answer_collection = database["answer"]
+
+async def connect_db():
+    try:
+        await client.admin.command('ping')
+        print("Connected to MongoDB")
+    except Exception as e:
+        print(f"Could not connect to MongoDB: {e}")
+
+async def close_db():
+    client.close()
+    print("MongoDB connection closed")
+
+
+async def add_question(question_data: dict):
+    new_question = await question_collection.insert_one(question_data)
+    return new_question.inserted_id
+
+async def add_option(option_data: dict):
+    new_option = await options_collection.insert_one(option_data)
+    return new_option.inserted_id
+
+async def add_answer(answer_data: dict):
+    new_answer = await answer_collection.insert_one(answer_data)
+    return new_answer.inserted_id
+
+import time
+
+async def add_chat_history(chat_history_data: dict):
+    timestamp = int(time.time())
+    chat_history_data["_id"] = f"{chat_history_data['patient_name']}_{chat_history_data['age']}_{timestamp}"
+    new_chat_history = await chat_history_collection.insert_one(chat_history_data)
+    return new_chat_history.inserted_id
+
+# You can add more functions here for reading, updating, and deleting data later
+
+
+
+
+
+
+

@@ -1,0 +1,3821 @@
+v12  -- -- --374/378 , 321, 224 
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+
+
+
+import os
+from dotenv import load_dotenv
+from database import get_db_connection
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    name: str
+    gender: str
+    age: int
+    language: str  # New field for language
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a professional medical assistant.,Based on conversation history, and preferred language, generate exactly 5 multiple-choice questions (one at a time) to gather information about the patient’s condition and question must be  related to given disease.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- All questions and options must be in the selected language: {language}.
+- after 5 questions end conversatio by  recommend consulting a doctor for further assistance and suggest for download the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+
+
+
+
+
+@app.get("/show_tables")
+async def show_tables():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+        cursor = conn.cursor()
+        cursor.execute("SHOW TABLES;")
+        tables = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        conn.close()
+        return {"tables": tables}
+    except Exception as e:
+        logger.error(f"Error fetching tables: {str(e)}")
+        raise HTTPException(500, "Could not fetch tables")
+@app.get("/show_doctors")
+async def show_doctors():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM doctors;")
+        doctors = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {"doctors": doctors}
+    except Exception as e:
+        logger.error(f"Error fetching doctors: {str(e)}")
+        raise HTTPException(500, "Could not fetch doctors")
+
+
+@app.get("/test_db_connection")
+async def test_db_connection():
+    conn = get_db_connection()
+    if conn:
+        conn.close()
+        return {"status": "success", "message": "Successfully connected to the database."}
+    raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+
+
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                MEDICAL_PROMPT.format(
+                    conversation_history=conv_history,
+                    language=request.language  # Include the user's selected language
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+    
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+import formImage from './img.png';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+    language: 'English', // New field for language
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages, // Pass the entire conversation history
+          language: formData.language,    // Added field
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,        // Include name
+          gender: formData.gender,    // Include gender
+          age: formData.age,          // Include age
+          language: formData.language, // Include language
+          conversation_history: messages,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          language: formData.language, // Include language in the request
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <img src={formImage} alt="Medical Illustration" className="form-image" />
+          <div>
+            <h2>Enter Your Details</h2>
+            <form>
+              <label>
+                Name:
+                <input
+                  type="text"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                />
+              </label>
+              <label>
+                Age:
+                <input
+                  type="number"
+                  value={formData.age}
+                  onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+                />
+              </label>
+              <label>
+                Gender:
+                <select
+                  value={formData.gender}
+                  onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+                >
+                  <option value="Male">Male</option>
+                  <option value="Female">Female</option>
+                  <option value="Other">Other</option>
+                </select>
+              </label>
+              <label>
+                Problem:
+                <input
+                  type="text"
+                  value={formData.department}
+                  onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+                />
+              </label>
+              <label>
+                Language:
+                <select
+                  value={formData.language}
+                  onChange={(e) => setFormData({ ...formData, language: e.target.value })}
+                >
+                  <option value="English">English</option>
+                  <option value="Hindi">हिंदी</option>
+                  <option value="Telugu">తెలుగు</option>
+                </select>
+              </label>
+              <div className="form-buttons">
+                <button type="button" onClick={handleFormSubmit}>
+                  Open Chatbot
+                </button>
+                <button type="button" onClick={generateOfflineReport}>
+                  Offline Report
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+----------------------------------------------v13 -754,363,224-----------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict,Any
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+import re
+
+
+import os
+from dotenv import load_dotenv
+from database import get_db_connection
+
+# NEW IMPORTS FOR AGENTS AND TOOLS
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import tool
+from langchain_core.prompts import PromptTemplate # Ensure this is imported for the agent prompt
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage # <--- ENSURE AIMESSAGE IS HERE
+
+
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    name: str
+    gender: str
+    age: int
+    language: str  # New field for language
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a professional medical assistant.,Based on conversation history, and preferred language, generate exactly 5 multiple-choice questions (one at a time) to gather information about the patient’s condition and question must be  related to given disease.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- All questions and options must be in the selected language: {language}.
+- after 5 questions end conversatio by  recommend consulting a doctor for further assistance and suggest for download the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+
+INITIAL_CHOICE_PROMPT = (
+    "Welcome! Would you like to proceed with:\n"
+    "A. Medical Diagnosis\n"
+    "B. Appointment Booking\n"
+    "Please type 'Diagnosis' or 'Appointment' to continue."
+)
+
+
+APPOINTMENT_SYSTEM_PROMPT = """
+You are a helpful medical appointment assistant.
+Your job is to help the user book an appointment with a doctor.
+If the user hasn't provided a department or doctor name, ask them for it.
+Once the user provides either a department or doctor name, show a friendly confirmation and list doctors from the provided list.
+If more user details are needed (name, age, etc.), ask for them politely.
+Always reply in the user's selected language: {language}.
+"""
+
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+
+
+
+
+
+@app.get("/show_tables")
+async def show_tables():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+        cursor = conn.cursor()
+        cursor.execute("SHOW TABLES;")
+        tables = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        conn.close()
+        return {"tables": tables}
+    except Exception as e:
+        logger.error(f"Error fetching tables: {str(e)}")
+        raise HTTPException(500, "Could not fetch tables")
+@app.get("/show_doctors")
+async def show_doctors():
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM doctors;")
+        doctors = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {"doctors": doctors}
+    except Exception as e:
+        logger.error(f"Error fetching doctors: {str(e)}")
+        raise HTTPException(500, "Could not fetch doctors")
+
+
+@app.get("/test_db_connection")
+async def test_db_connection():
+    conn = get_db_connection()
+    if conn:
+        conn.close()
+        return {"status": "success", "message": "Successfully connected to the database."}
+    raise HTTPException(status_code=500, detail="Failed to connect to the database.")
+
+
+
+# --- LangChain Tools for Appointment Booking ---
+
+@tool
+def get_doctors_by_department(department: str) -> str:
+    """
+    Use this tool to find doctors specializing in a particular medical department.
+    Input should be the department name (e.g., 'Cardiology', 'General Medicine', 'Orthopedic').
+    Returns a list of doctors with their names, departments, and timings.
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return "Error: Could not connect to the database."
+        cursor = conn.cursor(dictionary=True)
+        query = "SELECT name, department, timings FROM doctors WHERE department LIKE %s"
+        cursor.execute(query, (f"%{department}%",))
+        doctors = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if doctors:
+            doctor_list_str = "\n".join([
+                f"- Name: {doc['name']}, Department: {doc['department']}, Timings: {doc['timings']}"
+                for doc in doctors
+            ])
+            return f"Found the following doctors in {department} department:\n{doctor_list_str}"
+        else:
+            return f"No doctors found for department: {department}. Please try another department."
+    except Exception as e:
+        logger.error(f"Error in get_doctors_by_department: {str(e)}")
+        return f"An error occurred while fetching doctors by department: {str(e)}"
+
+@tool
+def get_doctor_details_by_name(doctor_name: str) -> str:
+    """
+    Use this tool to get specific information about a doctor, such as their department and available timings.
+    Input should be the doctor's full name (e.g., 'Dr. Anjali Mehta', 'Dr. Sharma').
+    Returns the doctor's details if found.
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return "Error: Could not connect to the database."
+        cursor = conn.cursor(dictionary=True)
+        
+        # --- MODIFIED LINE: Added LOWER() for case-insensitive matching ---
+        query = "SELECT name, department, timings FROM doctors WHERE LOWER(name) LIKE %s"
+        
+        # Prepare the search term: convert to lowercase and add wildcards
+        search_term = f"%{doctor_name.lower()}%"
+        
+        # --- NEW LOGGING LINE: To see what the LLM is sending ---
+        logger.info(f"get_doctor_details_by_name: Querying for doctor_name='{doctor_name}' with search_term='{search_term}'")
+        
+        cursor.execute(query, (search_term,)) 
+        doctor = cursor.fetchone() 
+        cursor.close()
+        conn.close()
+
+        if doctor:
+            return (
+                f"Doctor Name: {doctor['name']}\n"
+                f"Department: {doctor['department']}\n"
+                f"Timings: {doctor['timings']}"
+            )
+        else:
+            return f"No details found for doctor: {doctor_name}. Please check the name and try again."
+    except Exception as e:
+        logger.error(f"Error in get_doctor_details_by_name: {str(e)}")
+        return f"An error occurred while fetching doctor details: {str(e)}"
+
+
+
+# Define the tools list (ensure these are defined before handle_appointment_flow)
+appointment_tools = [get_doctors_by_department, get_doctor_details_by_name]
+
+
+async def handle_appointment_flow(request: ChatRequest) -> Dict[str, Any]:
+    try:
+        # --- START OF FIX: Handle initial interaction in appointment flow ---
+        # This checks if it's the very first actual user message in this flow.
+        # The `conversation_history` includes the system message `selected_flow: appointment`
+        # as well as the user's initial input (e.g., "appointment").
+        # If the count of displayable messages (user/assistant) is 0 or 1 (just the initial 'appointment' input),
+        # we provide a guiding message.
+        
+        # Calculate displayable messages (excluding system messages)
+        displayable_messages_count = sum(1 for msg in request.conversation_history if msg["role"] != "system")
+        
+        # If there are 0 or 1 displayable messages, it's the start of the flow, provide a guiding message.
+        if displayable_messages_count <= 3: 
+            if request.language == "Hindi":
+                return {"response": "नमस्ते! मैं आपके लिए डॉक्टरों को ढूंढने या अपॉइंटमेंट के बारे में जानकारी देने में मदद कर सकता हूँ। आप किस विभाग के डॉक्टर की तलाश में हैं, या क्या आप किसी विशिष्ट डॉक्टर के बारे में जानकारी चाहते हैं?"}
+            elif request.language == "Telugu":
+                return {"response": "నమస్కారం! నేను మీకు డాక్టర్లను కనుగొనడంలో లేదా అపాయింట్‌మెంట్ల గురించి సమాచారం ఇవ్వడంలో సహాయపడగలను. మీరు ఏ విభాగం డాక్టర్ కోసం చూస్తున్నారు, లేదా మీరు ఏదైనా నిర్దిష్ట డాక్టర్ గురించి సమాచారం కోరుకుంటున్నారా?"}
+            else:
+                return {"response": "Hello! I can help you find doctors or provide information about appointments. Which department are you looking for, or are you interested in details about a specific doctor?"}
+
+        # --- END OF FIX: Handle initial interaction ---
+
+        # 1. Prepare history for the agent's memory
+        formatted_history = []
+        for msg in request.conversation_history:
+            if msg["role"] == "user":
+                formatted_history.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                formatted_history.append(AIMessage(content=msg["content"]))
+
+        # 2. Define the Agent's System Prompt
+        agent_template = f"""You are a helpful medical appointment assistant.
+        Your goal is to help users find doctors or get details about specific doctors based on their queries.
+        You have access to the following tools:
+
+        {{tools}}
+
+        Use the tools to answer the user's questions.
+
+        When a user asks to find doctors for a health problem or by department, use the `get_doctors_by_department` tool.
+        When a user asks for details about a specific doctor by name (e.g., "Dr. Sharma", "Dr. Anjali Mehta"), use the `get_doctor_details_by_name` tool.
+
+        If a tool returns no results, politely inform the user.
+        If the user's request is unclear, ask for more information (e.g., "Which department are you looking for?" or "Can you provide the full name of the doctor?").
+        After providing doctor information, offer to assist further (e.g., "Would you like to search for other doctors or get details about another one?").
+        Always reply in the user's selected language: {request.language}.
+
+        **IMPORTANT: Do not hallucinate or make up doctor names, departments, or timings. Always use the provided tools to find actual information from the database.**
+
+        ---
+
+        Follow this thought process and use the tools effectively:
+
+        Question: the input question you must answer
+        Thought: you should always think about what to do
+        Action: the action to take, should be one of [{{tool_names}}]
+        Action Input: the input to the action
+        Observation: the result of the action
+        ... (this Thought/Action/Action Input/Observation can repeat N times)
+        Thought: I now know the final answer
+        Final Answer: the final answer to the original input question
+
+        Begin!
+
+        Previous conversation history:
+        {{chat_history}}
+
+        Question: {{input}}
+        Thought:{{agent_scratchpad}}
+        """
+
+        # 3. Create the LangChain Prompt Template
+        agent_prompt = PromptTemplate.from_template(agent_template)
+
+        # 4. Initialize Memory
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        memory.chat_memory.messages = formatted_history
+
+        # 5. Create the LangChain Agent
+        agent = create_react_agent(llm, appointment_tools, agent_prompt)
+
+        # 6. Create the AgentExecutor
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=appointment_tools,
+            memory=memory,
+            verbose=True, # Keep this True for debugging
+            handle_parsing_errors=True
+        )
+
+        # 7. Invoke the Agent with the current user input
+        response_dict = await agent_executor.ainvoke({"input": request.user_input})
+
+        # Ensure we always return a dictionary with a 'response' key
+        return {"response": response_dict.get("output", "I'm sorry, I couldn't process that request.")}
+
+    except Exception as e:
+        logger.error(f"Agent appointment flow error: {str(e)}")
+        # Provide a generic error message in the requested language
+        if request.language == "Hindi":
+            return {"response": "क्षमा करें, मुझे एक त्रुटि का सामना करना पड़ा। कृपया पुनः प्रयास करें।"}
+        elif request.language == "Telugu":
+            return {"response": "క్షమించండి, నాకు ఒక లోపం ఎదురైంది. దయచేసి మళ్ళీ ప్రయత్నించండి."}
+        else:
+            return {"response": "Sorry, I encountered an error during the appointment process. Please try again."}
+
+
+
+
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        # 1. Detect new session (no conversation yet)
+        if not request.conversation_history:
+            return {"response": INITIAL_CHOICE_PROMPT}
+
+        # 2. Look for a previously selected flow in the conversation history
+        flow_marker = None
+        for msg in request.conversation_history:
+            if msg["role"] == "system" and "selected_flow" in msg.get("content", ""):
+                flow_marker = msg["content"].split(":")[1].strip()
+                break
+
+        # 3. If no flow_marker, check if the user just made the initial choice
+        last_user_message = next(
+            (msg["content"].strip().lower() for msg in reversed(request.conversation_history) if msg["role"] == "user"),
+            ""
+        )
+
+        if not flow_marker:
+            if "diagnosis" in last_user_message:
+                # Add a marker for diagnosis flow
+                request.conversation_history.append({"role": "system", "content": "selected_flow: diagnosis"})
+                flow_marker = "diagnosis"
+            elif "appointment" in last_user_message:
+                # Add a marker for appointment flow
+                request.conversation_history.append({"role": "system", "content": "selected_flow: appointment"})
+                flow_marker = "appointment"
+            else:
+                # Still waiting for a valid initial choice
+                return {"response": INITIAL_CHOICE_PROMPT}
+
+        # 4. Process based on active flow
+        if flow_marker == "diagnosis":
+            # Existing diagnosis logic
+            conv_history = "\n".join(
+                f"{msg['role'].upper()}: {msg['content']}"
+                for msg in request.conversation_history if msg['role'] != "system"
+            )
+            prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(
+                    MEDICAL_PROMPT.format(
+                        conversation_history=conv_history,
+                        language=request.language
+                    )
+                ),
+                HumanMessagePromptTemplate.from_template("{user_input}"),
+            ])
+            chain = LLMChain(llm=llm, prompt=prompt)
+            response = await chain.arun(user_input=request.user_input)
+            return {"response": response.strip()}
+
+        elif flow_marker == "appointment":
+            # Appointment booking logic
+            return await handle_appointment_flow(request)
+
+        # Fallback
+        return {"response": INITIAL_CHOICE_PROMPT}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+
+
+
+
+
+# --- Add a stub for the appointment handler for now ---
+
+import re
+
+async def handle_appointment_flow(request: ChatRequest):
+    # 1. Prepare conversation (ignore 'system' messages)
+    conv_history = "\n".join(
+        f"{msg['role'].upper()}: {msg['content']}"
+        for msg in request.conversation_history if msg['role'] != "system"
+    )
+
+    user_latest = next(
+        (msg["content"] for msg in reversed(request.conversation_history) if msg["role"] == "user"),
+        ""
+    )
+    user_latest_lower = user_latest.lower()
+
+    # 2. Extract department or doctor name
+    department = None
+    doctor_name = None
+
+    departments = [
+        "General Physician", "Cardiologist", "Pediatrician", "Orthopedic", "Gynecologist",
+        "Dermatologist", "ENT Specialist", "Neurologist", "Psychiatrist", "Dentist"
+    ]
+    for dept in departments:
+        if dept.lower() in user_latest_lower:
+            department = dept
+            break
+
+    # Doctor extraction (looks for 'Dr. <Name>')
+    doctor_match = re.search(r'dr\.?\s+[a-zA-Z]+', user_latest)
+    if doctor_match:
+        doctor_name = doctor_match.group().strip()
+
+    # 3. Query MySQL for doctors
+    doctors_list = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        if department:
+            cursor.execute(
+                "SELECT * FROM doctors WHERE department = %s",
+                (department,)
+            )
+        elif doctor_name:
+            cursor.execute(
+                "SELECT * FROM doctors WHERE name LIKE %s",
+                (f"%{doctor_name}%",)
+            )
+        cursor_result = cursor.fetchall()
+        if cursor_result:
+            doctors_list = cursor_result
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to fetch doctors: {str(e)}")
+
+    # 4. Build explicit doctors list for LLM
+    if doctors_list:
+        doctors_text = "\n".join([
+            f"{doc['name']} ({doc['department']}) - Available: {doc['timings']}"
+            for doc in doctors_list
+        ])
+        available_message = (
+            f"The following doctors are available for your request:\n{doctors_text}\n"
+            "Please let me know which doctor you would like to book an appointment with."
+        )
+    else:
+        # If no doctors found, prompt for more info or to try another department
+        available_message = (
+            "Sorry, I couldn't find any doctors matching your request. "
+            "Could you please provide a different department or doctor's name?"
+        )
+
+    # 5. LLM prompt to ONLY use this doctor list
+    APPOINTMENT_SYSTEM_PROMPT = """
+You are a helpful medical appointment assistant.
+ONLY suggest doctors from the provided list below. 
+If the list is empty, apologize and ask the user for another department or doctor's name.
+NEVER invent or assume doctors not in the list.
+Reply in {language}.
+----------------------
+{available_message}
+----------------------
+Conversation so far:
+{conversation_history}
+"""
+
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(
+            APPOINTMENT_SYSTEM_PROMPT.format(
+                language=request.language,
+                available_message=available_message,
+                conversation_history=conv_history
+            )
+        ),
+        HumanMessagePromptTemplate.from_template("{user_input}"),
+    ])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    response = await chain.arun(user_input=request.user_input or "")
+    return {"response": response.strip()}
+
+
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------363
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+import formImage from './img.png';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+    language: 'English', // New field for language
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) {
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    // Optimistically add user message for immediate display before sending
+    setMessages((prev) => [...prev, userMessage]); // This will trigger a re-render for the user message
+    setInput('');
+    setIsLoading(true);
+
+    // IMPORTANT: Create a new array that *includes* the latest user message
+    // and any existing system messages in 'messages' state,
+    // to send as conversation_history.
+    // 'messages' is async, so we use the `prev` state or a new array.
+    const messagesToSend = [...messages, userMessage];
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          // Send the full history including the newly added user message
+          conversation_history: messagesToSend,
+          language: formData.language,
+        }),
+      });
+
+      const data = await response.json();
+      let newMessages = [...messagesToSend]; // Start building the new state from what we just sent
+
+      // --- CRITICAL FIX FOR FLOW MARKER ---
+      // Check if a flow marker already exists in the local history being sent
+      const hasFlowMarker = messagesToSend.some(
+        (msg) => msg.role === 'system' && msg.content.startsWith('selected_flow:')
+      );
+
+      // If no flow marker exists and the user's input indicates a choice,
+      // manually add the system message to the frontend's local history.
+      // This replicates the backend's behavior of adding the marker internally.
+      if (!hasFlowMarker) {
+          const lowerInput = input.trim().toLowerCase();
+          if (lowerInput.includes("diagnosis")) {
+              newMessages.push({ role: 'system', content: `selected_flow: diagnosis` });
+          } else if (lowerInput.includes("appointment")) {
+              newMessages.push({ role: 'system', content: `selected_flow: appointment` });
+          }
+      }
+      // --- END CRITICAL FIX ---
+      
+      // Add the assistant's response to the new messages array
+      newMessages.push({ role: 'assistant', content: data.response });
+
+      // Update the state with the combined history, including the system message if added
+      setMessages(newMessages);
+
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      // Filter out 'system' messages before sending to generate_report,
+      // as generate_report doesn't need them in its prompt and might process them incorrectly.
+      const conversationHistoryForReport = messages.filter(msg => msg.role !== 'system');
+
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          gender: formData.gender,
+          age: formData.age,
+          language: formData.language,
+          conversation_history: conversationHistoryForReport, // Send filtered history
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) {
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          language: formData.language,
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      // Filter out 'system' messages before sending to suggest_department
+      const conversationHistoryForSuggestion = messages.filter(msg => msg.role !== 'system');
+
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: conversationHistoryForSuggestion,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <img src={formImage} alt="Medical Illustration" className="form-image" />
+          <div>
+            <h2>Enter Your Details</h2>
+            <form>
+              <label>
+                Name:
+                <input
+                  type="text"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                />
+              </label>
+              <label>
+                Age:
+                <input
+                  type="number"
+                  value={formData.age}
+                  onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+                />
+              </label>
+              <label>
+                Gender:
+                <select
+                  value={formData.gender}
+                  onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+                >
+                  <option value="Male">Male</option>
+                  <option value="Female">Female</option>
+                  <option value="Other">Other</option>
+                </select>
+              </label>
+              <label>
+                Problem:
+                <input
+                  type="text"
+                  value={formData.department}
+                  onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+                />
+              </label>
+              <label>
+                Language:
+                <select
+                  value={formData.language}
+                  onChange={(e) => setFormData({ ...formData, language: e.target.value })}
+                >
+                  <option value="English">English</option>
+                  <option value="Hindi">हिंदी</option>
+                  <option value="Telugu">తెలుగు</option>
+                </select>
+              </label>
+              <div className="form-buttons">
+                <button type="button" onClick={handleFormSubmit}>
+                  Open Chatbot
+                </button>
+                <button type="button" onClick={generateOfflineReport}>
+                  Offline Report
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  // Only render messages that are not of role 'system'
+                  msg.role !== 'system' && (
+                    <div key={index} className={`message ${msg.role}`}>
+                      {msg.content}
+                    </div>
+                  )
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+
+
+--------------------v14-750 same ------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict,Any
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+import re
+
+
+import os
+from dotenv import load_dotenv
+from database import get_db_connection
+
+# NEW IMPORTS FOR AGENTS AND TOOLS
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain.tools import tool
+from langchain_core.prompts import PromptTemplate # Ensure this is imported for the agent prompt
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage # <--- ENSURE AIMESSAGE IS HERE
+
+
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    name: str
+    gender: str
+    age: int
+    language: str  # New field for language
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a professional medical assistant.,Based on conversation history, and preferred language, generate exactly 5 multiple-choice questions (one at a time) to gather information about the patient’s condition and question must be  related to given disease.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- All questions and options must be in the selected language: {language}.
+- after 5 questions end conversatio by  recommend consulting a doctor for further assistance and suggest for download the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+
+INITIAL_CHOICE_PROMPT = (
+    "Welcome! Would you like to proceed with:\n"
+    "A. Medical Diagnosis\n"
+    "B. Appointment Booking\n"
+    "Please type 'Diagnosis' or 'Appointment' to continue."
+)
+
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+
+
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        # 1. Detect new session (no conversation yet)
+        if not request.conversation_history:
+            return {"response": INITIAL_CHOICE_PROMPT}
+
+        # 2. Look for a previously selected flow in the conversation history
+        flow_marker = None
+        for msg in request.conversation_history:
+            if msg["role"] == "system" and "selected_flow" in msg.get("content", ""):
+                flow_marker = msg["content"].split(":")[1].strip()
+                break
+
+        # 3. If no flow_marker, check if the user just made the initial choice
+        last_user_message = next(
+            (msg["content"].strip().lower() for msg in reversed(request.conversation_history) if msg["role"] == "user"),
+            ""
+        )
+
+        if not flow_marker:
+            if "diagnosis" in last_user_message:
+                # Add a marker for diagnosis flow
+                request.conversation_history.append({"role": "system", "content": "selected_flow: diagnosis"})
+                flow_marker = "diagnosis"
+            elif "appointment" in last_user_message:
+                # Add a marker for appointment flow
+                request.conversation_history.append({"role": "system", "content": "selected_flow: appointment"})
+                flow_marker = "appointment"
+            else:
+                # Still waiting for a valid initial choice
+                return {"response": INITIAL_CHOICE_PROMPT}
+
+        # 4. Process based on active flow
+        if flow_marker == "diagnosis":
+            # Existing diagnosis logic
+            conv_history = "\n".join(
+                f"{msg['role'].upper()}: {msg['content']}"
+                for msg in request.conversation_history if msg['role'] != "system"
+            )
+            prompt = ChatPromptTemplate.from_messages([
+                SystemMessagePromptTemplate.from_template(
+                    MEDICAL_PROMPT.format(
+                        conversation_history=conv_history,
+                        language=request.language
+                    )
+                ),
+                HumanMessagePromptTemplate.from_template("{user_input}"),
+            ])
+            chain = LLMChain(llm=llm, prompt=prompt)
+            response = await chain.arun(user_input=request.user_input)
+            return {"response": response.strip()}
+
+        elif flow_marker == "appointment":
+            # Appointment booking logic
+            return await handle_appointment_flow(request)
+
+        # Fallback
+        return {"response": INITIAL_CHOICE_PROMPT}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+
+
+
+
+
+# --- Add a stub for the appointment handler for now ---
+
+import re
+
+async def handle_appointment_flow(request: ChatRequest):
+    # 1. Prepare conversation (ignore 'system' messages)
+    conv_history = "\n".join(
+        f"{msg['role'].upper()}: {msg['content']}"
+        for msg in request.conversation_history if msg['role'] != "system"
+    )
+
+    user_latest = next(
+        (msg["content"] for msg in reversed(request.conversation_history) if msg["role"] == "user"),
+        ""
+    )
+    user_latest_lower = user_latest.lower()
+
+    # 2. Extract department or doctor name
+    department = None
+    doctor_name = None
+
+    departments = [
+        "General Physician", "Cardiologist", "Pediatrician", "Orthopedic", "Gynecologist",
+        "Dermatologist", "ENT Specialist", "Neurologist", "Psychiatrist", "Dentist"
+    ]
+    for dept in departments:
+        if dept.lower() in user_latest_lower:
+            department = dept
+            break
+
+    # Doctor extraction (looks for 'Dr. <Name>')
+    doctor_match = re.search(r'dr\.?\s+[a-zA-Z]+', user_latest)
+    if doctor_match:
+        doctor_name = doctor_match.group().strip()
+
+    # 3. Query MySQL for doctors
+    doctors_list = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        if department:
+            cursor.execute(
+                "SELECT * FROM doctors WHERE department = %s",
+                (department,)
+            )
+        elif doctor_name:
+            cursor.execute(
+                "SELECT * FROM doctors WHERE name LIKE %s",
+                (f"%{doctor_name}%",)
+            )
+        cursor_result = cursor.fetchall()
+        if cursor_result:
+            doctors_list = cursor_result
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to fetch doctors: {str(e)}")
+
+    # 4. Build explicit doctors list for LLM
+    if doctors_list:
+        doctors_text = "\n".join([
+            f"{doc['name']} ({doc['department']}) - Available: {doc['timings']}"
+            for doc in doctors_list
+        ])
+        available_message = (
+            f"The following doctors are available for your request:\n{doctors_text}\n"
+            "Please let me know which doctor you would like to book an appointment with."
+        )
+    else:
+        # If no doctors found, prompt for more info or to try another department
+        available_message = (
+            "Sorry, I couldn't find any doctors matching your request. "
+            "Could you please provide a different department or doctor's name?"
+        )
+
+    # 5. LLM prompt to ONLY use this doctor list
+    APPOINTMENT_SYSTEM_PROMPT = """
+You are a helpful medical appointment assistant.
+-At the start of the conversation, ask the user for their preferred department or doctor's name and don't suggest any doctor.
+-At the starting geeting the user for their preferred department or doctor's name.
+-Then based on the user's input, provide a list of doctors from the database.
+-ONLY suggest doctors from the provided list below. 
+-Don't suggest or assume any doctors not in the list for user.
+
+If the list is empty, apologize and ask the user for another department or doctor's name.
+NEVER invent or assume doctors not in the list.
+Reply in {language}.
+----------------------
+{available_message}
+----------------------
+Conversation so far:
+{conversation_history}
+"""
+
+    prompt = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(
+            APPOINTMENT_SYSTEM_PROMPT.format(
+                language=request.language,
+                available_message=available_message,
+                conversation_history=conv_history
+            )
+        ),
+        HumanMessagePromptTemplate.from_template("{user_input}"),
+    ])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    response = await chain.arun(user_input=request.user_input or "")
+    return {"response": response.strip()}
+
+
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+-----------------------------------v15 ,685, same ----------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict,Any
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+import re
+import json
+
+import os
+from dotenv import load_dotenv
+from database import get_db_connection
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    name: str
+    gender: str
+    age: int
+    language: str  # New field for language
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# Enhanced Agentic System Prompts
+GREETING_AGENT_PROMPT = """You are an intelligent medical assistant greeting agent. Generate a warm, professional greeting and ask the user what they need help with today.
+
+Instructions:
+- Generate a personalized greeting in {language}
+- Ask how you can help them today
+- Mention that you can help with medical diagnosis questions or appointment booking
+- Ask user to chose between diagnoisis or appointment booking.
+- Keep it natural and conversational
+- Don't use rigid options like "A" or "B"
+
+Generate a friendly greeting message."""
+
+INTENT_DETECTION_PROMPT = """You are an intelligent intent detection agent. Analyze the user's message and determine their intent.
+
+User message: {user_input}
+Language: {language}
+Current conversation context: {context}
+
+Possible intents:
+1. DIAGNOSIS - User wants medical diagnosis, health questions, symptoms analysis, medical consultation
+2. APPOINTMENT - User wants to book appointment, find doctor, schedule consultation
+3. SWITCH_TO_APPOINTMENT - User wants to switch from diagnosis to appointment booking
+4. SWITCH_TO_DIAGNOSIS - User wants to switch from appointment to diagnosis
+5. UNCLEAR - Intent is not clear, need more information
+
+Analyze the message and return ONLY one of these words: DIAGNOSIS, APPOINTMENT, SWITCH_TO_APPOINTMENT, SWITCH_TO_DIAGNOSIS, or UNCLEAR"""
+
+MEDICAL_PROMPT = """You are a professional medical assistant. Based on conversation history and preferred language, generate medical questions to gather information about the patient's condition.
+
+Current question count: {question_count}
+Total questions asked so far: {question_count}/5
+
+Instructions:
+- If question_count < 5: Generate the next multiple-choice question with exactly 4 options (A, B, C, D)
+- Don't repeat previous questions and their answers simple generate question and their options.
+- Each option must include **EHR-specific terminology** in parentheses
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability
+- All questions and options must be in the selected language: {language}
+- If question_count >= 5: Instead of generating more questions, recommend consulting a doctor and suggest booking an appointment. Ask if they want to book an appointment now.
+
+Conversation History:
+{conversation_history}
+
+Return the appropriate response based on question count."""
+
+SMART_APPOINTMENT_PROMPT = """You are an intelligent appointment booking assistant. 
+
+Current conversation:
+{conversation_history}
+
+Available doctors from database:
+{doctors_info}
+
+User's latest message: {user_input}
+Language: {language}
+
+Instructions:
+- If this is the start of appointment flow, ask what type of doctor or department they need
+- If doctors are available, present them in a friendly, conversational way
+- If no doctors found, ask for different department or doctor name
+- Be helpful and guide the user naturally
+- Respond in {language}
+- Don't invent doctors not in the database
+
+Generate appropriate response based on the context."""
+
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Enhanced Agentic Health Chatbot Backend API!"}
+
+# Enhanced Agentic Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        # 1. Handle initial greeting - Generate dynamic greeting
+        if not request.conversation_history:
+            greeting_response = await generate_greeting(request.language)
+            return {"response": greeting_response}
+
+        # 2. Check current flow and question count
+        current_flow = get_current_flow(request.conversation_history)
+        question_count = count_questions_asked(request.conversation_history)
+        
+        # 3. Detect user intent (including flow switching)
+        conv_context = get_conversation_context(request.conversation_history)
+        intent = await detect_user_intent(request.user_input, request.language, conv_context)
+        
+        # 4. Handle flow switching
+        if intent == "SWITCH_TO_APPOINTMENT":
+            # Switch from diagnosis to appointment
+            update_flow_marker(request.conversation_history, "appointment")
+            return await handle_smart_appointment_flow(request)
+        
+        elif intent == "SWITCH_TO_DIAGNOSIS":
+            # Switch from appointment to diagnosis
+            update_flow_marker(request.conversation_history, "diagnosis")
+            return await handle_diagnosis_flow(request)
+        
+        # 5. Handle existing flows
+        if current_flow == "diagnosis":
+            # Check if we should transition to appointment after 5 questions
+            if question_count >= 5 and intent == "APPOINTMENT":
+                update_flow_marker(request.conversation_history, "appointment")
+                return await handle_smart_appointment_flow(request)
+            else:
+                return await handle_diagnosis_flow(request, question_count)
+        
+        elif current_flow == "appointment":
+            # Check if user wants diagnosis instead
+            if intent == "DIAGNOSIS":
+                update_flow_marker(request.conversation_history, "diagnosis")
+                return await handle_diagnosis_flow(request)
+            else:
+                return await handle_smart_appointment_flow(request)
+        
+        else:
+            # 6. No flow determined yet - use intelligent intent detection
+            if intent == "DIAGNOSIS":
+                request.conversation_history.append({
+                    "role": "system", 
+                    "content": "selected_flow: diagnosis"
+                })
+                return await handle_diagnosis_flow(request)
+            
+            elif intent == "APPOINTMENT":
+                request.conversation_history.append({
+                    "role": "system", 
+                    "content": "selected_flow: appointment"
+                })
+                return await handle_smart_appointment_flow(request)
+            
+            else:  # UNCLEAR intent
+                clarification_response = await generate_clarification(request.user_input, request.language)
+                return {"response": clarification_response}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Agentic Helper Functions
+async def generate_greeting(language: str) -> str:
+    """Generate dynamic, personalized greeting"""
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(GREETING_AGENT_PROMPT.format(language=language))
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Greeting generation error: {str(e)}")
+        return "Hello! How can I help you today? I can assist with medical diagnosis questions or appointment booking."
+
+async def detect_user_intent(user_input: str, language: str, context: str = "") -> str:
+    """Intelligently detect user's intent including flow switching"""
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                INTENT_DETECTION_PROMPT.format(
+                    user_input=user_input, 
+                    language=language,
+                    context=context
+                )
+            )
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        
+        # Extract intent from response
+        intent = response.strip().upper()
+        valid_intents = ["DIAGNOSIS", "APPOINTMENT", "SWITCH_TO_APPOINTMENT", "SWITCH_TO_DIAGNOSIS", "UNCLEAR"]
+        if intent in valid_intents:
+            return intent
+        else:
+            return "UNCLEAR"
+            
+    except Exception as e:
+        logger.error(f"Intent detection error: {str(e)}")
+        return "UNCLEAR"
+
+async def generate_clarification(user_input: str, language: str) -> str:
+    """Generate clarification message when intent is unclear"""
+    clarification_prompt = f"""The user said: "{user_input}"
+
+Generate a friendly clarification message in {language} asking whether they want:
+1. Medical diagnosis/health questions
+2. Appointment booking with doctors
+
+Keep it conversational and helpful."""
+    
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(clarification_prompt)
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Clarification generation error: {str(e)}")
+        return "I'd be happy to help! Could you let me know if you need help with medical diagnosis questions or booking an appointment with a doctor?"
+
+def get_current_flow(conversation_history: List[Dict[str, str]]) -> str:
+    """Extract current flow from conversation history"""
+    # Get the most recent flow marker
+    for msg in reversed(conversation_history):
+        if msg["role"] == "system" and "selected_flow" in msg.get("content", ""):
+            return msg["content"].split(":")[1].strip()
+    return None
+
+def count_questions_asked(conversation_history: List[Dict[str, str]]) -> int:
+    """Count how many medical questions have been asked"""
+    question_count = 0
+    for msg in conversation_history:
+        if msg["role"] == "assistant":
+            content = msg.get("content", "").lower()
+            # Check if message contains multiple choice options (A., B., C., D.)
+            if "a." in content and "b." in content and "c." in content and "d." in content:
+                question_count += 1
+    return question_count
+
+def get_conversation_context(conversation_history: List[Dict[str, str]]) -> str:
+    """Get conversation context for better intent detection"""
+    current_flow = get_current_flow(conversation_history)
+    question_count = count_questions_asked(conversation_history)
+    
+    context = f"Current flow: {current_flow or 'none'}, Questions asked: {question_count}"
+    
+    # Add recent conversation context
+    recent_messages = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
+    recent_context = " | ".join([
+        f"{msg['role']}: {msg['content'][:50]}..." 
+        for msg in recent_messages if msg['role'] != 'system'
+    ])
+    
+    return f"{context} | Recent: {recent_context}"
+
+def update_flow_marker(conversation_history: List[Dict[str, str]], new_flow: str):
+    """Update flow marker in conversation history"""
+    # Remove old flow markers
+    conversation_history[:] = [
+        msg for msg in conversation_history 
+        if not (msg["role"] == "system" and "selected_flow" in msg.get("content", ""))
+    ]
+    # Add new flow marker
+    conversation_history.append({
+        "role": "system", 
+        "content": f"selected_flow: {new_flow}"
+    })
+
+async def handle_diagnosis_flow(request: ChatRequest, question_count: int = None):
+    """Handle diagnosis flow with question counting and transition logic"""
+    try:
+        if question_count is None:
+            question_count = count_questions_asked(request.conversation_history)
+        
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}"
+            for msg in request.conversation_history if msg['role'] != "system"
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                MEDICAL_PROMPT.format(
+                    conversation_history=conv_history,
+                    language=request.language,
+                    question_count=question_count
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        
+        # If we've asked 5 questions and system suggests appointment, prepare for potential flow switch
+        if question_count >= 5 and ("appointment" in response.lower() or "book" in response.lower()):
+            # Add a subtle hint that flow switching is possible without forcing it
+            response += "\n\nYou can also type 'yes' or 'book appointment' if you'd like to schedule a consultation now."
+        
+        return {"response": response.strip()}
+        
+    except Exception as e:
+        logger.error(f"Diagnosis flow error: {str(e)}")
+        raise HTTPException(500, "Diagnosis processing failed")
+
+async def handle_smart_appointment_flow(request: ChatRequest):
+    """Enhanced appointment flow with intelligent doctor suggestions"""
+    try:
+        # Extract user's latest message
+        user_latest = request.user_input or ""
+        user_latest_lower = user_latest.lower()
+
+        # Smart doctor search
+        doctors_list = await smart_doctor_search(user_latest)
+        
+        # Build doctors info for LLM
+        if doctors_list:
+            doctors_text = "\n".join([
+                f"Dr. {doc['name']} - {doc['department']} - Available: {doc['timings']}"
+                for doc in doctors_list
+            ])
+        else:
+            doctors_text = "No doctors found matching the current request."
+
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}"
+            for msg in request.conversation_history if msg['role'] != "system"
+        )
+
+        # Generate smart response
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                SMART_APPOINTMENT_PROMPT.format(
+                    conversation_history=conv_history,
+                    doctors_info=doctors_text,
+                    user_input=user_latest,
+                    language=request.language
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=user_latest)
+        return {"response": response.strip()}
+        
+    except Exception as e:
+        logger.error(f"Smart appointment flow error: {str(e)}")
+        raise HTTPException(500, "Appointment processing failed")
+
+async def smart_doctor_search(user_input: str) -> List[Dict]:
+    """Intelligent doctor search based on user input"""
+    try:
+        doctors_list = []
+        user_input_lower = user_input.lower()
+        
+        # Define departments for search
+        departments = [
+            "General Physician", "Cardiologist", "Pediatrician", "Orthopedic", 
+            "Gynecologist", "Dermatologist", "ENT Specialist", "Neurologist", 
+            "Psychiatrist", "Dentist"
+        ]
+        
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # Smart search logic
+        # 1. Search by department keywords
+        department_found = None
+        for dept in departments:
+            if dept.lower() in user_input_lower or any(word in user_input_lower for word in dept.lower().split()):
+                department_found = dept
+                break
+        
+        # 2. Search by doctor name
+        doctor_match = re.search(r'dr\.?\s+([a-zA-Z]+)', user_input_lower)
+        doctor_name = doctor_match.group(1) if doctor_match else None
+        
+        # 3. Execute database query
+        if department_found:
+            cursor.execute("SELECT * FROM doctors WHERE department = %s", (department_found,))
+        elif doctor_name:
+            cursor.execute("SELECT * FROM doctors WHERE name LIKE %s", (f"%{doctor_name}%",))
+        else:
+            # If no specific department/doctor, show some general doctors
+            cursor.execute("SELECT * FROM doctors LIMIT 5")
+        
+        doctors_list = cursor.fetchall() or []
+        cursor.close()
+        conn.close()
+        
+        return doctors_list
+        
+    except Exception as e:
+        logger.error(f"Smart doctor search error: {str(e)}")
+        return []
+
+
+
+
+
+
+
+
+
+
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+-----------------base date -30/05-------------
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict,Any
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+import re
+import json
+
+import os
+from dotenv import load_dotenv
+from database import get_db_connection
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    name: str
+    gender: str
+    age: int
+    language: str  # New field for language
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# Enhanced Agentic System Prompts
+GREETING_AGENT_PROMPT = """You are an intelligent medical assistant greeting agent. Generate a warm, professional greeting and ask the user what they need help with today.
+
+Instructions:
+- Generate a personalized greeting in {language}
+- Ask how you can help them today
+- Mention that you can help with medical diagnosis questions or appointment booking
+- Ask user to chose between diagnoisis or appointment booking.
+- Keep it natural and conversational
+- Don't use rigid options like "A" or "B"
+
+Generate a friendly greeting message."""
+
+INTENT_DETECTION_PROMPT = """You are an intelligent intent detection agent. Analyze the user's message and determine their intent.
+
+User message: {user_input}
+Language: {language}
+Current conversation context: {context}
+
+Possible intents:
+1. DIAGNOSIS - User wants medical diagnosis, health questions, symptoms analysis, medical consultation ,health diagnosis.
+2. APPOINTMENT - User wants to book appointment, find doctor, schedule consultation 
+3. SWITCH_TO_APPOINTMENT - User wants to switch from diagnosis to appointment booking by askin doctor name , department or appointment is mentioned , asking for doctor suggestion.
+4. SWITCH_TO_DIAGNOSIS - User wants to switch from appointment to diagnosis by saying proble ,unable to understand, asking for medical questions.
+5. UNCLEAR - Intent is not clear, need more information.
+
+Analyze the message and return ONLY one of these words: DIAGNOSIS, APPOINTMENT, SWITCH_TO_APPOINTMENT, SWITCH_TO_DIAGNOSIS, or UNCLEAR"""
+
+MEDICAL_PROMPT = """You are a professional medical assistant. Based on conversation history and preferred language, generate medical questions to gather information about the patient's condition.
+
+Current question count: {question_count}
+Total questions asked so far: {question_count}/5
+
+Instructions:
+- If question_count < 5: Generate the next multiple-choice question with exactly 4 options (A, B, C, D)
+- Don't repeat previous questions and their answers simple generate question and their options.
+- Each option must include **EHR-specific terminology** in parentheses
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability
+- All questions and options must be in the selected language: {language}
+- If question_count >= 5: Instead of generating more questions, recommend consulting a doctor and suggest booking an appointment. Ask if they want to book an appointment now.
+
+Conversation History:
+{conversation_history}
+Return the appropriate response based on question count."""
+
+
+
+SMART_APPOINTMENT_PROMPT = """You are an intelligent appointment booking assistant. 
+
+Current conversation:
+{conversation_history}
+
+Available doctors from database:
+{doctors_info}
+
+User's latest message: {user_input}
+Language: {language}
+
+CRITICAL INSTRUCTIONS:
+- When doctors are available, you MUST present ALL doctors from the database results
+- NEVER select just one doctor - always show the complete list
+- Format each doctor as: "• Dr. [Name] - [Department] - Available: [Timings]"
+- After listing all doctors, ask user to choose which doctor they prefer
+- If this is the start of appointment flow, ask what type of doctor or department they need
+- If no doctors found, ask for different department or doctor name
+- Be helpful and guide the user naturally
+- Respond in {language}
+- Don't invent doctors not in the database
+
+EXAMPLE FORMAT when multiple doctors available:
+"Here are all our available cardiologists:
+
+- Dr. [Name1] - Cardiology - Available: [Timings1]
+- Dr. [Name2] - Cardiology - Available: [Timings2] 
+- Dr. [Name3] - Cardiology - Available: [Timings3]
+
+Which doctor would you like to book an appointment with?"
+
+Generate appropriate response based on the context."""
+
+
+
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+
+REPORT_PROMPT = """Generate a comprehensive and professional pre-medical consultation assessment report with structured formatting and clarity. The report should include the following sections:
+
+**Questions and Responses**
+- Include all questions asked during the consultation along with the response provided by the patient in {language}.
+- Each question should be clearly listed with its text and the available options (A, B, C, D) displayed on separate lines in {language}.
+- Highlight the selected option on its own line in **bold** for emphasis.
+- Do not invent or assume any additional questions beyond those {conversation_history}.
+
+**Patient Summary**
+- Provide a concise summary of the patient's condition based on the selected responses {language}.
+- Reference specific questions and options to justify the overview.
+- Chief Complaint: {chief_complaint}.
+
+**Clinical History**
+{history}
+
+**Assessment**
+- Evaluate the symptoms described by the patient and identify any potential areas of concern.
+- Ensure consistency between the analysis and the responses provided to the questions.
+
+**Recommendations**
+- Based on the selected responses, classify the case as **High Risk**, **Medium Risk**, or **Low Risk**.
+- Justify the classification using system-defined rules.
+
+**Formatting Guidelines**
+- Add proper line spacing between sections to ensure readability.
+- Use **bold headings** and properly indent the content under each heading.
+- Maintain a professional tone and concise language appropriate for medical review.
+"""
+
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+            
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    print("Function: root")
+    return {"message": "Welcome to the Enhanced Agentic Health Chatbot Backend API!"}
+
+# Enhanced Agentic Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    print("Function: chat")
+    try:
+        # 1. Handle initial greeting - Generate dynamic greeting
+        if not request.conversation_history:
+            greeting_response = await generate_greeting(request.language)
+            return {"response": greeting_response}
+
+        # 2. Check current flow and question count
+        current_flow = get_current_flow(request.conversation_history)
+        question_count = count_questions_asked(request.conversation_history)
+        
+        # 3. Detect user intent (including flow switching)
+        conv_context = get_conversation_context(request.conversation_history)
+        intent = await detect_user_intent(request.user_input, request.language, conv_context)
+        
+        # 4. Handle flow switching
+        if intent == "SWITCH_TO_APPOINTMENT":
+            # Switch from diagnosis to appointment
+            update_flow_marker(request.conversation_history, "appointment")
+            return await handle_smart_appointment_flow(request)
+        
+        elif intent == "SWITCH_TO_DIAGNOSIS":
+            # Switch from appointment to diagnosis
+            update_flow_marker(request.conversation_history, "diagnosis")
+            return await handle_diagnosis_flow(request)
+        
+        # 5. Handle existing flows
+        if current_flow == "diagnosis":
+            # Check if we should transition to appointment after 5 questions
+            if question_count >= 5 and intent == "APPOINTMENT":
+                update_flow_marker(request.conversation_history, "appointment")
+                return await handle_smart_appointment_flow(request)
+            else:
+                return await handle_diagnosis_flow(request, question_count)
+        
+        elif current_flow == "appointment":
+            # Check if user wants diagnosis instead
+            if intent == "DIAGNOSIS":
+                update_flow_marker(request.conversation_history, "diagnosis")
+                return await handle_diagnosis_flow(request)
+            else:
+                return await handle_smart_appointment_flow(request)
+        
+        else:
+            # 6. No flow determined yet - use intelligent intent detection
+            if intent == "DIAGNOSIS":
+                request.conversation_history.append({
+                    "role": "system", 
+                    "content": "selected_flow: diagnosis"
+                })
+                return await handle_diagnosis_flow(request)
+            
+            elif intent == "APPOINTMENT":
+                request.conversation_history.append({
+                    "role": "system", 
+                    "content": "selected_flow: appointment"
+                })
+                return await handle_smart_appointment_flow(request)
+            
+            else:  # UNCLEAR intent
+                clarification_response = await generate_clarification(request.user_input, request.language)
+                return {"response": clarification_response}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Agentic Helper Functions
+async def generate_greeting(language: str) -> str:
+    print("Function: generate_greeting")
+    """Generate dynamic, personalized greeting"""
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(GREETING_AGENT_PROMPT.format(language=language))
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Greeting generation error: {str(e)}")
+        return "Hello! How can I help you today? I can assist with medical diagnosis questions or appointment booking."
+
+async def detect_user_intent(user_input: str, language: str, context: str = "") -> str:
+    print("Function: detect_user_intent")
+    """Intelligently detect user's intent including flow switching"""
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                INTENT_DETECTION_PROMPT.format(
+                    user_input=user_input, 
+                    language=language,
+                    context=context
+                )
+            )
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        
+        # Extract intent from response
+        intent = response.strip().upper()
+        valid_intents = ["DIAGNOSIS", "APPOINTMENT", "SWITCH_TO_APPOINTMENT", "SWITCH_TO_DIAGNOSIS", "UNCLEAR"]
+        if intent in valid_intents:
+            return intent
+        else:
+            return "UNCLEAR"
+            
+    except Exception as e:
+        logger.error(f"Intent detection error: {str(e)}")
+        return "UNCLEAR"
+
+async def generate_clarification(user_input: str, language: str) -> str:
+    print("Function: generate_clarification")
+    """Generate clarification message when intent is unclear"""
+    clarification_prompt = f"""The user said: "{user_input}"
+
+Generate a friendly clarification message in {language} asking whether they want:
+1. Medical diagnosis/health questions
+2. Appointment booking with doctors
+
+Keep it conversational and helpful."""
+    
+    try:
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(clarification_prompt)
+        ])
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(input="")
+        return response.strip()
+    except Exception as e:
+        logger.error(f"Clarification generation error: {str(e)}")
+        return "I'd be happy to help! Could you let me know if you need help with medical diagnosis questions or booking an appointment with a doctor?"
+
+def get_current_flow(conversation_history: List[Dict[str, str]]) -> str:
+    print("Function: get_current_flow")
+    """Extract current flow from conversation history"""
+    # Get the most recent flow marker
+    for msg in reversed(conversation_history):
+        if msg["role"] == "system" and "selected_flow" in msg.get("content", ""):
+            return msg["content"].split(":")[1].strip()
+    return None
+
+def count_questions_asked(conversation_history: List[Dict[str, str]]) -> int:
+    print("Function: count_questions_asked")
+    """Count how many medical questions have been asked"""
+    question_count = 0
+    for msg in conversation_history:
+        if msg["role"] == "assistant":
+            content = msg.get("content", "").lower()
+            # Check if message contains multiple choice options (A., B., C., D.)
+            if "a." in content and "b." in content and "c." in content and "d." in content:
+                question_count += 1
+    return question_count
+
+def get_conversation_context(conversation_history: List[Dict[str, str]]) -> str:
+    print("Function: get_conversation_context")
+    """Get conversation context for better intent detection"""
+    current_flow = get_current_flow(conversation_history)
+    question_count = count_questions_asked(conversation_history)
+    
+    context = f"Current flow: {current_flow or 'none'}, Questions asked: {question_count}"
+    
+    # Add recent conversation context
+    recent_messages = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
+    recent_context = " | ".join([
+        f"{msg['role']}: {msg['content'][:50]}..." 
+        for msg in recent_messages if msg['role'] != 'system'
+    ])
+    
+    return f"{context} | Recent: {recent_context}"
+
+def update_flow_marker(conversation_history: List[Dict[str, str]], new_flow: str):
+    print("Function: update_flow_marker")
+    """Update flow marker in conversation history"""
+    # Remove old flow markers
+    conversation_history[:] = [
+        msg for msg in conversation_history 
+        if not (msg["role"] == "system" and "selected_flow" in msg.get("content", ""))
+    ]
+    # Add new flow marker
+    conversation_history.append({
+        "role": "system", 
+        "content": f"selected_flow: {new_flow}"
+    })
+
+async def handle_diagnosis_flow(request: ChatRequest, question_count: int = None):
+    print("Function: handle_diagnosis_flow")
+    """Handle diagnosis flow with question counting and transition logic"""
+    try:
+        if question_count is None:
+            question_count = count_questions_asked(request.conversation_history)
+        
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}"
+            for msg in request.conversation_history if msg['role'] != "system"
+        )
+        
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                MEDICAL_PROMPT.format(
+                    conversation_history=conv_history,
+                    language=request.language,
+                    question_count=question_count
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        # print(response)
+        # If we've asked 5 questions and system suggests appointment, prepare for potential flow switch
+        if question_count >= 5 and ("appointment" in response.lower() or "book" in response.lower()):
+            # Add a subtle hint that flow switching is possible without forcing it
+            response += "\n\nYou can also type 'yes' or 'book appointment' if you'd like to schedule a consultation now."
+        
+        return {"response": response.strip()}
+        
+    except Exception as e:
+        logger.error(f"Diagnosis flow error: {str(e)}")
+        raise HTTPException(500, "Diagnosis processing failed")
+
+async def handle_smart_appointment_flow(request: ChatRequest):
+    print("Function: handle_smart_appointment_flow")
+    """Enhanced appointment flow with intelligent doctor suggestions"""
+    try:
+        # Extract user's latest message
+        user_latest = request.user_input or ""
+        user_latest_lower = user_latest.lower()
+
+        # Smart doctor search
+        doctors_list = await smart_doctor_search(user_latest)
+        
+        # Build doctors info for LLM
+        # Change this part:
+        if doctors_list:
+            doctors_text = f"IMPORTANT: Show ALL {len(doctors_list)} doctors listed below to the user:\n" + "\n".join([
+                f"• Dr. {doc['name']} - {doc['department']} - Available: {doc.get('timings', 'Contact for timings')}"
+                for doc in doctors_list
+            ])
+        else:
+            doctors_text = "No doctors found matching the current request."
+                # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}"
+            for msg in request.conversation_history if msg['role'] != "system"
+        )
+
+        # Generate smart response
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                SMART_APPOINTMENT_PROMPT.format(
+                    conversation_history=conv_history,
+                    doctors_info=doctors_text,
+                    user_input=user_latest,
+                    language=request.language
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=user_latest)
+        return {"response": response.strip()}
+        
+    except Exception as e:
+        logger.error(f"Smart appointment flow error: {str(e)}")
+        raise HTTPException(500, "Appointment processing failed")
+
+import re
+
+async def smart_doctor_search(user_input: str) -> list:
+    logger.info("Function: smart_doctor_search")
+    try:
+        doctors_list = []
+        user_input_lower = user_input.lower()
+
+        # Departments for search (your original logic)
+        departments = [
+            "General Physician", "Cardiologist", "Pediatrician", "Orthopedic", 
+            "Gynecologist", "Dermatologist", "ENT Specialist", "Neurologist", 
+            "Psychiatrist", "Dentist"
+        ]
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 1. Search by department keywords (unchanged)
+        department_found = None
+        for dept in departments:
+            if dept.lower() in user_input_lower or any(word in user_input_lower for word in dept.lower().split()):
+                department_found = dept
+                break
+
+        if department_found:
+            cursor.execute("SELECT * FROM doctors WHERE department = %s", (department_found,))
+        else:
+            # 2. Search for doctor name (improved logic)
+            # Try to extract name after "Dr." or "doctor"
+            name_patterns = [
+                r'dr\.?\s*([a-zA-Z\s]+)',     # e.g. Dr. Rajiv Khanna
+                r'doctor\s+([a-zA-Z\s]+)',    # e.g. doctor Rajiv Khanna
+            ]
+            doctor_name = None
+            for pattern in name_patterns:
+                match = re.search(pattern, user_input, re.IGNORECASE)
+                if match:
+                    doctor_name = match.group(1).strip()
+                    break
+            # If no match, try any capitalized word (not 'Dr' or 'Doctor')
+            if not doctor_name:
+                tokens = user_input.split()
+                possible_names = [t for t in tokens if t.istitle() and t.lower() not in ['dr', 'doctor']]
+                if possible_names:
+                    doctor_name = " ".join(possible_names)
+            # If still nothing, fallback to all doctors
+            if doctor_name:
+                # Search for name case-insensitively, match anywhere in the string
+                cursor.execute(
+                    "SELECT * FROM doctors WHERE LOWER(name) LIKE %s",
+                    (f"%{doctor_name.lower()}%",)
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM doctors WHERE department IN ('General Physician', 'Cardiologist', 'Pediatrician') LIMIT 10"
+                )
+
+        doctors_list = cursor.fetchall() or []
+        cursor.close()
+        conn.close()
+        return doctors_list
+
+    except Exception as e:
+        logger.error(f"Smart doctor search error: {str(e)}")
+        return []
+
+
+
+
+
+
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:    
+        # Extract name, gender, and age from the request
+        name = request.name
+        gender = request.gender
+        age = request.age
+        language = request.language  # New field for language support
+        
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history","language"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history,
+            language=language  # Include language in the prompt
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        # Styles
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Patient Details Section
+        story.append(Paragraph("Patient Details", heading_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Name: {name}", body_style))
+        story.append(Paragraph(f"Gender: {gender}", body_style))
+        story.append(Paragraph(f"Age: {age}", body_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")

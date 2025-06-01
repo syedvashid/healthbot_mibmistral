@@ -1,0 +1,1943 @@
+base code (V7)
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+
+
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """
+You are a professional medical assistant. Based on the user's health-related input and conversation history, generate exactly 5 multiple-choice (one by one)  questions to gather more information about the patient’s condition.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- At the end, recommend consulting a doctor for further assistance and suggest downloading the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """
+Generate a professional pre medical consultation assessment report with clear organization and formatting. The report should include the following sections:
+
+Questions and Responses
+- For each question, include the question text and the option selected by the patient.
+- Only include questions actually asked by the user  Do not assume or add any extra questions.
+- Each question should be clearly labeled and formatted for easy reading 
+- Each options for every question should be listed in a new line and clearly labeled as A, B, C, D.
+- Selected option should be listed in its own line after the options and should be oriented in bold.
+
+Patient Summary
+- Summarize the patient's condition based on the selected options from the questions.
+- Ensure the summary is concise and references the specific questions and responses to justify the conclusions Chief Complaint: {chief_complaint}.
+
+Clinical History
+{history}
+
+Assessment
+- Analyze the patient's symptoms and highlight any potential concerns.
+- Ensure the analysis is consistent with the responses to the questions.
+
+Recommendations.
+- Include system given rules to flag high risk, medium risk and low risk cases based on the selected responses in one word.
+
+ Ensure proper line spacing between sections for readability.
+ Bold each heading and indent content under each heading as per the professional writing guidelines.
+ Use professional and concise language suitable for doctor review.
+"""
+OFFLINE_REPORT_PROMPT = """Generate a professional offline medical report with lines gap and other formatting which helps to understand the report easily:
+
+**Patient Details**
+- Name: {name}
+- Age: {age}
+- Gender: {gender}
+- Department: {department}
+
+Based on the following responses:
+{responses}
+
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(MEDICAL_PROMPT.format(conversation_history=conv_history)),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    #  - Name: {name}
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "responses"],           
+            template=("""Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+
+            Generate no more than 5 questions to gather additional information about the patient's condition. Each question should have exactly 4 options. Provide EHR-specific terminology in parentheses for each option. Help me with auto flagging rules for high risk cases. Return the questions and options in proper JSON format.
+                      -Ensure the line formatting is in JSON format.
+                      -professional offline medical report with lines gap and other formatting which helps to understand the report easily.           
+            """)
+
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        questions_json = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            responses=request.responses,
+        )
+
+        questions = questions_json.strip()
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+            },
+            "Questions": questions,
+            "Remarks": "This is an auto-generated offline medical report with additional questions for further assessment."
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+        import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department) {
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages, // Pass the entire conversation history
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department) {
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <h2>Enter Your Details</h2>
+          <form>
+            <label>
+              Name:
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </label>
+            <label>
+              Age:
+              <input
+                type="number"
+                value={formData.age}
+                onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+              />
+            </label>
+            <label>
+              Gender:
+              <select
+                value={formData.gender}
+                onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+              >
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+            </label>
+            <label>
+            Problem:
+              <input
+                type="text"
+                value={formData.department}
+                onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+              />
+            </label>
+            <div className="form-buttons">
+              <button type="button" onClick={handleFormSubmit}>
+                Open Chatbot
+              </button>
+              <button type="button" onClick={generateOfflineReport}>
+                Offline Report
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+
+////////////////////////////////code base version //////////////////////////////
+
+
+
+//modified code where json questions are multilanguage sapported
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+
+
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """
+You are a professional medical assistant. Based on the user's health-related input and conversation history, generate exactly 5 multiple-choice (one by one)  questions to gather more information about the patient’s condition.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- At the end, recommend consulting a doctor for further assistance and suggest downloading the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """
+Generate a professional pre medical consultation assessment report with clear organization and formatting. The report should include the following sections:
+
+Questions and Responses
+- For each question, include the question text and the option selected by the patient.
+- Only include questions actually asked by the user  Do not assume or add any extra questions.
+- Each question should be clearly labeled and formatted for easy reading 
+- Each options for every question should be listed in a new line and clearly labeled as A, B, C, D.
+- Selected option should be listed in its own line after the options and should be oriented in bold.
+
+Patient Summary
+- Summarize the patient's condition based on the selected options from the questions.
+- Ensure the summary is concise and references the specific questions and responses to justify the conclusions Chief Complaint: {chief_complaint}.
+
+Clinical History
+{history}
+
+Assessment
+- Analyze the patient's symptoms and highlight any potential concerns.
+- Ensure the analysis is consistent with the responses to the questions.
+
+Recommendations.
+- Include system given rules to flag high risk, medium risk and low risk cases based on the selected responses in one word.
+
+ Ensure proper line spacing between sections for readability.
+ Bold each heading and indent content under each heading as per the professional writing guidelines.
+ Use professional and concise language suitable for doctor review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+# Core Chat Endpoint
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(MEDICAL_PROMPT.format(conversation_history=conv_history)),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+    language: 'English', // New field for language
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages, // Pass the entire conversation history
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          language: formData.language, // Include language in the request
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <h2>Enter Your Details</h2>
+          <form>
+            <label>
+              Name:
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </label>
+            <label>
+              Age:
+              <input
+                type="number"
+                value={formData.age}
+                onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+              />
+            </label>
+            <label>
+              Gender:
+              <select
+                value={formData.gender}
+                onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+              >
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+            </label>
+            <label>
+              Problem:
+              <input
+                type="text"
+                value={formData.department}
+                onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+              />
+            </label>
+            <label>
+              Language:
+              <select
+                value={formData.language}
+                onChange={(e) => setFormData({ ...formData, language: e.target.value })}
+              >
+                <option value="English">English</option>
+                <option value="Hindi">हिंदी</option>
+                <option value="Telgu">తెలుగు</option>
+              </select>
+            </label>
+            <div className="form-buttons">
+              <button type="button" onClick={handleFormSubmit}>
+                Open Chatbot
+              </button>
+              <button type="button" onClick={generateOfflineReport}>
+                Offline Report
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+//////////////////////////////////////////v8 code json and /chat are multilengual//////////////////////////////////below--->306,315
+
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from langchain_ollama import ChatOllama
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    PromptTemplate
+)
+from langchain.chains import LLMChain
+import logging
+from fastapi.responses import JSONResponse, StreamingResponse
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph ,Spacer
+from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
+import asyncio
+from reportlab.lib.enums import TA_LEFT
+
+
+
+
+
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    user_input: str
+    conversation_history: List[Dict[str, str]] = []
+    language: str  # New field for language support
+
+class HistoryRequest(BaseModel):
+    conversation_history: List[Dict[str, str]]
+
+class OfflineReportRequest(BaseModel):
+    name: str
+    age: int
+    gender: str
+    department: str
+    language: str  # New field for language
+    responses: List[Dict]
+
+# Initialize Ollama
+llm = ChatOllama(
+    model="llama3",
+    temperature=0.7,
+    max_tokens=500,
+    timeout=30
+)
+
+# System Prompts
+MEDICAL_PROMPT = """You are a professional medical assistant.,Based on conversation history, and preferred language, generate exactly 5 multiple-choice questions (one at a time) to gather  information about the patient’s condition.
+
+Instructions:
+- Each question must have **exactly 4 options** in new lines, labeled A, B, C, and D.
+- Each option must include **EHR-specific terminology** in parentheses.
+- The format for options should be: "A. Description (EHR Term)"
+- Add a **new line** between each question and between each option for better readability.
+- All questions and options must be in the selected language: {language}.
+- after 5 questions, recommend consulting a doctor for further assistance and suggest downloading the PDF report.
+
+Conversation History:
+{conversation_history}
+
+Return only the formatted questions and options, followed by the final suggestion.
+"""
+DEPARTMENT_PROMPT = """Analyze this health conversation and suggest ONE most relevant medical department:
+Cardiology, Neurology, General Medicine, Orthopedics, Dermatology, ENT, Psychiatry, Gynecology, Gastroenterology.
+
+Conversation:
+{conversation_history}
+
+Return ONLY the department name."""
+REPORT_PROMPT = """
+Generate a professional pre medical consultation assessment report with clear organization and formatting. The report should include the following sections:
+
+Questions and Responses
+- For each question, include the question text and the option selected by the patient.
+- Only include questions actually asked by the user  Do not assume or add any extra questions.
+- Each question should be clearly labeled and formatted for easy reading 
+- Each options for every question should be listed in a new line and clearly labeled as A, B, C, D.
+- Selected option should be listed in its own line after the options and should be oriented in bold.
+
+Patient Summary
+- Summarize the patient's condition based on the selected options from the questions.
+- Ensure the summary is concise and references the specific questions and responses to justify the conclusions Chief Complaint: {chief_complaint}.
+
+Clinical History
+{history}
+
+Assessment
+- Analyze the patient's symptoms and highlight any potential concerns.
+- Ensure the analysis is consistent with the responses to the questions.
+
+Recommendations.
+- Include system given rules to flag high risk, medium risk and low risk cases based on the selected responses in one word.
+
+ Ensure proper line spacing between sections for readability.
+ Bold each heading and indent content under each heading as per the professional writing guidelines.
+ Use professional and concise language suitable for doctor review.
+"""
+OFFLINE_REPORT_PROMPT = """ Based on the following patient details:
+           
+            - Age: {age}
+            - Gender: {gender}
+            - Problem: {department}
+            - Responses: {responses}
+            - Language: {language}
+ - Generate text (questions and their options) must be in specific {language}. 
+ Generate  5 questions to gather information about the patient's condition. Each question should have exactly 4 options in Language .
+ Provide EHR-specific terminology in parentheses for each option. 
+ Help with auto flagging rules for high risk cases. 
+ Return the questions and options in JSON format.
+        
+Provide a concise yet professional summary for doctor review."""
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Health Chatbot Backend API!"}
+
+# Core Chat Endpoint
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                MEDICAL_PROMPT.format(
+                    conversation_history=conv_history,
+                    language=request.language  # Include the user's selected language
+                )
+            ),
+            HumanMessagePromptTemplate.from_template("{user_input}"),
+        ])
+        
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = await chain.arun(user_input=request.user_input)
+        
+        return {"response": response.strip()}
+
+    except Exception as e:
+        logger.error(f"Chat error: {str(e)}")
+        raise HTTPException(500, "Chat processing failed")
+    
+# Department Suggestion
+@app.post("/suggest_department")
+async def suggest_department(request: HistoryRequest):
+    try:
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+        
+        prompt = PromptTemplate(
+            input_variables=["conversation_history"],
+            template=DEPARTMENT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        department = await chain.arun(conversation_history=conv_history)
+        return {"department": department.strip()}
+    
+    except Exception as e:
+        logger.error(f"Department error: {str(e)}")
+        return {"department": "General Medicine"}
+
+# PDF Report Generation
+
+@app.post("/generate_report")
+async def generate_report(request: HistoryRequest):
+    try:
+        # Extract chief complaint
+        chief_complaint = next(
+            (msg["content"] for msg in request.conversation_history 
+             if msg["role"] == "user"),
+            "Not specified"
+        )
+        
+        # Build conversation history
+        conv_history = "\n".join(
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in request.conversation_history
+        )
+
+        # Prepare LangChain LLM call
+        prompt = PromptTemplate(
+            input_variables=["chief_complaint", "history", "conversation_history"],
+            template=REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_text = await chain.arun(
+            chief_complaint=chief_complaint,
+            history="From conversation",
+            conversation_history=conv_history
+        )
+
+        # PDF Generation with styling
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+
+        base_styles = getSampleStyleSheet()
+        heading_style = ParagraphStyle(
+            'Heading',
+            parent=base_styles['Heading2'],
+            fontSize=14,
+            spaceAfter=10,
+            spaceBefore=12,
+            leftIndent=0,
+            alignment=TA_LEFT,
+            fontName='Helvetica-Bold'
+        )
+        body_style = ParagraphStyle(
+            'Body',
+            parent=base_styles['Normal'],
+            fontSize=11,
+            leading=16,
+            leftIndent=20
+        )
+
+        story = []
+
+        # Title
+        story.append(Paragraph("Medical Consultation Report", heading_style))
+        story.append(Spacer(1, 12))
+
+        # Split report into sections and format
+        for paragraph in report_text.split('\n\n'):
+            stripped = paragraph.strip()
+            if not stripped:
+                continue
+            if stripped.endswith(":"):  # Assume it's a heading
+                story.append(Spacer(1, 10))
+                story.append(Paragraph(stripped, heading_style))
+            else:
+                story.append(Paragraph(stripped, body_style))
+            story.append(Spacer(1, 6))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=medical_report.pdf"}
+        )
+
+    except Exception as e:
+        logger.error(f"Report error: {str(e)}")
+        raise HTTPException(500, "Report generation failed")
+
+# Offline Report Generation
+
+@app.post("/generate_offline_report")
+async def generate_offline_report(request: OfflineReportRequest):
+    try:
+        prompt = PromptTemplate(
+            input_variables=["name", "age", "gender", "department", "language", "responses"],
+            template=OFFLINE_REPORT_PROMPT
+        )
+        chain = LLMChain(llm=llm, prompt=prompt)
+        report_content = await chain.arun(
+            name=request.name,
+            age=request.age,
+            gender=request.gender,
+            department=request.department,
+            language=request.language,  # Include language in the prompt
+            responses=request.responses,
+        )
+
+        report = {
+            "Patient Details": {
+                "Name": request.name,
+                "Age": request.age,
+                "Gender": request.gender,
+                "Department": request.department,
+                "Language": request.language,  # Include language in the JSON response
+            },
+            "Report": report_content,
+            "Remarks": "This is an auto-generated offline medical  with language consideration.",
+        }
+
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": "attachment; filename=offline_report.json"}
+        )
+    except Exception as e:
+        logger.error(f"Error in /generate_offline_report endpoint: {str(e)}")
+        raise HTTPException(500, "Offline report generation failed")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useRef, useEffect } from 'react';
+import './App.css';
+
+function App() {
+  const [step, setStep] = useState('form'); // 'form' or 'chatbot'
+  const [formData, setFormData] = useState({
+    name: '',
+    age: '',
+    gender: 'Male',
+    department: 'General Medicine',
+    language: 'English', // New field for language
+  });
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [suggestedDepartment, setSuggestedDepartment] = useState(''); // State for suggested department
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (step === 'chatbot') scrollToBottom();
+  }, [messages, step]);
+
+  const handleFormSubmit = () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before proceeding.');
+      return;
+    }
+    setStep('chatbot');
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_input: input,
+          conversation_history: messages, // Pass the entire conversation history
+          language: formData.language,    // Added field
+        }),
+      });
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Sorry, I encountered an error. Please try again.' },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateReport = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before generating a report.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+        }),
+      });
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'medical_report.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Report error:', error);
+      alert('Failed to generate report');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const generateOfflineReport = async () => {
+    if (!formData.name || !formData.age || !formData.department || !formData.language) { // Validate language
+      alert('Please fill all the fields before generating the offline report.');
+      return;
+    }
+
+    // Simulate responses for the assessment questions
+    const responses = [
+      { questionId: 1, option: 'A' },
+      { questionId: 2, option: 'C' },
+      { questionId: 3, option: 'B' },
+      { questionId: 4, option: 'D' },
+      { questionId: 5, option: 'A' },
+    ];
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/generate_offline_report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: formData.name,
+          age: formData.age,
+          gender: formData.gender,
+          department: formData.department,
+          language: formData.language, // Include language in the request
+          responses: responses,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to generate offline report.');
+      }
+
+      const data = await response.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'offline_report.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (error) {
+      console.error('Offline Report Error:', error);
+      alert('Failed to generate offline report.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const suggestDepartment = async () => {
+    if (messages.length === 0) {
+      alert('Please have a conversation before suggesting a department.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const response = await fetch('http://localhost:8000/suggest_department', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversation_history: messages,
+        }),
+      });
+
+      const data = await response.json();
+      setSuggestedDepartment(data.department || 'General Medicine');
+      alert(`Suggested Department: ${data.department || 'General Medicine'}`);
+    } catch (error) {
+      console.error('Error suggesting department:', error);
+      alert('Failed to suggest department.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>Medical Chatbot</h1>
+      </header>
+      {step === 'form' ? (
+        <div className="form-container">
+          <h2>Enter Your Details</h2>
+          <form>
+            <label>
+              Name:
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </label>
+            <label>
+              Age:
+              <input
+                type="number"
+                value={formData.age}
+                onChange={(e) => setFormData({ ...formData, age: e.target.value })}
+              />
+            </label>
+            <label>
+              Gender:
+              <select
+                value={formData.gender}
+                onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+              >
+                <option value="Male">Male</option>
+                <option value="Female">Female</option>
+                <option value="Other">Other</option>
+              </select>
+            </label>
+            <label>
+              Problem:
+              <input
+                type="text"
+                value={formData.department}
+                onChange={(e) => setFormData({ ...formData, department: e.target.value })}
+              />
+            </label>
+            <label>
+              Language:
+              <select
+                value={formData.language}
+                onChange={(e) => setFormData({ ...formData, language: e.target.value })}
+              >
+                <option value="English">English</option>
+                <option value="Hindi">हिंदी</option>
+                <option value="Telugu">తెలుగు</option>
+              </select>
+            </label>
+            <div className="form-buttons">
+              <button type="button" onClick={handleFormSubmit}>
+                Open Chatbot
+              </button>
+              <button type="button" onClick={generateOfflineReport}>
+                Offline Report
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : (
+        <div className="chat-container">
+          <div className="chat-box">
+            <div className="messages">
+              {messages.length === 0 ? (
+                <div className="welcome-message">
+                  <p>Describe your symptoms...</p>
+                </div>
+              ) : (
+                messages.map((msg, index) => (
+                  <div key={index} className={`message ${msg.role}`}>
+                    {msg.content}
+                  </div>
+                ))
+              )}
+              <div ref={messagesEndRef} />
+              {isLoading && <div className="message assistant typing">Typing...</div>}
+            </div>
+
+            <form onSubmit={handleSubmit} className="input-area">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your symptoms..."
+                disabled={isLoading}
+              />
+              <button type="submit" disabled={isLoading}>
+                Send
+              </button>
+            </form>
+
+            <div className="report-container">
+              <button
+                onClick={generateReport}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Generate PDF Report
+              </button>
+              <button
+                onClick={suggestDepartment}
+                disabled={isLoading || messages.length === 0}
+                className="report-btn"
+              >
+                Suggest Department
+              </button>
+            </div>
+
+            {suggestedDepartment && (
+              <div className="suggested-department">
+                <p>Suggested Department: {suggestedDepartment}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+
+
+
+
+
